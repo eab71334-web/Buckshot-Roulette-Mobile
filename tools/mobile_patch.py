@@ -163,3 +163,25 @@ with open("scripts/AchievementManager.gd", "w", encoding="utf-8") as f:
 print("Patched scripts/AchievementManager.gd → mobile stub")
 
 print("mobile_patch.py done.")
+
+# ── project.godot — register Steam stub as autoload ───────────────────────────
+# GodotSteam registers "Steam" as a native singleton (C++ level), so it is NOT
+# an autoload entry in project.godot. On mobile the native plugin is absent, so
+# "Steam" is undefined. We inject an autoload entry that points to our GDScript
+# stub so every script that calls Steam.* resolves it at runtime.
+import re as _re
+
+PROJ = "project.godot"
+proj = open(PROJ, encoding="utf-8").read()
+
+# Only add if not already present
+if 'Steam="*res://addons/godotsteam/steam_stub.gd"' not in proj:
+    proj = _re.sub(
+        r'(\[autoload\]\n)',
+        r'\1Steam="*res://addons/godotsteam/steam_stub.gd"\n',
+        proj, count=1
+    )
+    open(PROJ, "w", encoding="utf-8").write(proj)
+    print("project.godot → added Steam autoload stub")
+else:
+    print("project.godot → Steam autoload already present")
