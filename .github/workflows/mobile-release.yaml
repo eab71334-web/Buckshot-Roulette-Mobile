@@ -67,6 +67,9 @@ jobs:
       - name: Import project assets
         run: tools/godot/Godot --headless --path . --import
 
+      - name: Patch Steam scripts for mobile
+        run: python3 tools/mobile_patch.py
+
       - name: Export iOS Xcode project
         run: |
           set -euxo pipefail
