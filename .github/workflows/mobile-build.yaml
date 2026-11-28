@@ -1,0 +1,200 @@
+name: Build Godot (iOS + Android)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      GODOT_VERSION: "4.3"
+      EXPORT_PRESET_IOS: "iOS"
+      EXPORT_PRESET_ANDROID: "Android"
+      EXPORT_DIR_IOS: "build/ios"
+      EXPORT_DIR_ANDROID: "build/android"
+      ARCHIVE_PATH: "build/App.xcarchive"
+      IPA_NAME: "Buckshot-${{ github.sha }}.ipa"
+      APK_NAME: "Buckshot-${{ github.sha }}.apk"
+      APK32_NAME: "Buckshot-32bit-${{ github.sha }}.apk"
+      DEPLOYMENT_TARGET: "12.0"
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install xcpretty
+        run: |
+          sudo gem install xcpretty
+
+      - name: Install Godot (headless) and templates
+        run: |
+          set -euxo pipefail
+          mkdir -p tools/godot
+          cd tools/godot
+          curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
+          unzip -q godot.zip
+          # Keep the binary inside Godot.app: moved out, its signature breaks and
+          # Apple Silicon runners kill it (exit 137).
+          printf '#!/bin/sh\nexec "%s/Godot.app/Contents/MacOS/Godot" "$@"\n' "$PWD" > Godot
+          chmod +x Godot
+          touch .gdignore
+          ./Godot --headless --version
+          cd -
+          TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "${TEMPLATES_DIR}"
+          curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q templates.tpz -d templates_unpacked
+          cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
+
+      - name: Import project assets
+        run: tools/godot/Godot --headless --path . --import
+
+      - name: Export iOS Xcode project (project only)
+        run: |
+          set -euxo pipefail
+          mkdir -p "${EXPORT_DIR_IOS}"
+          tools/godot/Godot --headless --path . --export-release "${EXPORT_PRESET_IOS}" "${EXPORT_DIR_IOS}"
+
+      - name: Set iOS deployment target
+        run: |
+          set -euxo pipefail
+          PROJ_BUNDLE="$(/usr/bin/find "${EXPORT_DIR_IOS}/../" -maxdepth 4 -type d -name '*.xcodeproj' -print -quit || true)"
+          if [[ -z "${PROJ_BUNDLE}" ]]; then
+            echo "No .xcodeproj found near ${EXPORT_DIR_IOS}"
+            echo "Tree under ${EXPORT_DIR_IOS}:"
+            find "${EXPORT_DIR_IOS}" -maxdepth 4 -print || true
+            echo "Dumping iOS export preset from export_presets.cfg for debugging:"
+            awk '
+              BEGIN{p=0}
+              /^\[preset\.[0-9]+\]/{p=0}
+              /\[preset\.[0-9]+\]/{blk=$0}
+              /platform="iOS"/{p=1; print blk}
+              p && /\[preset\.[0-9]+\.options\]/{print; next}
+              p && /^[^[]/{print}
+            ' export_presets.cfg || true
+            exit 1
+          fi
+          echo "Using Xcode project: ${PROJ_BUNDLE}"
+          PBX="${PROJ_BUNDLE}/project.pbxproj"
+          perl -0777 -pe "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = ${DEPLOYMENT_TARGET};/g" -i "${PBX}"
+
+      - name: Build .xcarchive (unsigned)
+        run: |
+          set -euxo pipefail
+          PROJ_BUNDLE="$(/usr/bin/find "${EXPORT_DIR_IOS}/../" -maxdepth 4 -type d -name '*.xcodeproj' -print -quit || true)"
+          if [[ -z "${PROJ_BUNDLE}" ]]; then
+            echo "No .xcodeproj found for build step."
+            exit 1
+          fi
+          echo "Using Xcode project: ${PROJ_BUNDLE}"
+
+          SCHEME="$(xcodebuild -list -json -project "${PROJ_BUNDLE}" \
+            | /usr/bin/python3 -c 'import sys,json; d=json.load(sys.stdin); p=d.get("project",{}); s=p.get("schemes",[]); print(s[0] if s else "")')"
+
+          if [[ -z "${SCHEME}" ]]; then
+            echo "No schemes found in ${PROJ_BUNDLE}"
+            xcodebuild -list -project "${PROJ_BUNDLE}" || true
+            exit 1
+          fi
+          echo "Using scheme: ${SCHEME}"
+
+          xcodebuild \
+            -project "${PROJ_BUNDLE}" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -archivePath "${ARCHIVE_PATH}" \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            clean archive | xcpretty
+
+          test -d "${ARCHIVE_PATH}"
+
+      - name: Create .ipa (unsigned)
+        run: |
+          set -euxo pipefail
+
+          APP_DIR="${ARCHIVE_PATH}/Products/Applications"
+          if [[ ! -d "${APP_DIR}" ]]; then
+            echo "Archive missing Applications dir: ${APP_DIR}"
+            find "${ARCHIVE_PATH}" -maxdepth 4 -print
+            exit 1
+          fi
+
+          APP_PATH="$(/usr/bin/find "${APP_DIR}" -maxdepth 1 -type d -name "*.app" -print -quit || true)"
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "No .app found in ${APP_DIR}"
+            ls -al "${APP_DIR}" || true
+            exit 1
+          fi
+          echo "Packaging app: ${APP_PATH}"
+
+          rm -rf Payload "${IPA_NAME}"
+          mkdir -p Payload
+          cp -R "${APP_PATH}" Payload/
+
+          # --- Option A (recommended): keeps Payload as the top-level folder
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload "${IPA_NAME}"
+
+          # --- Option B (zip): also keeps Payload at the top level
+          # /usr/bin/zip -qry "${IPA_NAME}" Payload
+
+          # Sanity check: list IPA contents to confirm Payload/YourApp.app structure
+          /usr/bin/unzip -l "${IPA_NAME}" | sed -n '1,10p'
+
+      # Two separate downloads, kept for a short time only. The IPA goes up first
+      # so an Android problem cannot lose it.
+      - name: Upload IPA (iPhone)
+        uses: actions/upload-artifact@v4
+        with:
+          name: iphone-ipa
+          path: ${{ env.IPA_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Export Android APK (unsigned)
+        run: |
+          set -euxo pipefail
+          tools/godot/Godot --headless --path . --export-release "${EXPORT_PRESET_ANDROID}" "${APK_NAME}"
+          test -s "${APK_NAME}"
+
+      # Android refuses unsigned apps. A throwaway key is made for each build, so
+      # an older install has to be removed before installing a newer APK.
+      - name: Sign and verify APK
+        run: tools/sign_apk.sh "${APK_NAME}" arm64-v8a
+
+      - name: Upload APK (Android)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: ${{ env.APK_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+      # Older 32-bit phones (Android 5+ with OpenGL ES 3.0). Changes the project
+      # files, so it must stay after the other builds.
+      - name: Export 32-bit Android APK
+        run: |
+          set -euxo pipefail
+          python3 tools/lowend.py
+          tools/godot/Godot --headless --path . --export-release "${EXPORT_PRESET_ANDROID}" "${APK32_NAME}"
+          test -s "${APK32_NAME}"
+
+      - name: Sign and verify 32-bit APK
+        run: tools/sign_apk.sh "${APK32_NAME}" armeabi-v7a
+
+      - name: Upload 32-bit APK (Android)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-32bit
+          path: ${{ env.APK32_NAME }}
+          if-no-files-found: error
+          retention-days: 1
